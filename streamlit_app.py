@@ -1,15 +1,15 @@
 """
-币市 × 股市 联动监控（初始版）
-- 标的：HOOD/MSTR/CRCL + BTC/ETH/SOL + Hood链 PONS/CASHCAT/AI/TENDIES
-- 15分钟自动刷新 + 手动刷新
-- 涨跌对比、简单相关、量能变化、异动提示
+币市 × 股市 联动监控（完整初始版）
+- 标的：HOOD/MSTR/CRCL + BTC/ETH/SOL + Hood: PONS/CASHCAT/AI/TENDIES
+- BTC/ETH/SOL：Binance 多域名 → yfinance → CoinGecko
+- 15 分钟自动刷新 + 手动刷新
 """
 
 from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -20,113 +20,225 @@ import streamlit as st
 import yfinance as yf
 
 # =========================
-# 配置：按你之前的标的
+# 配置
 # =========================
 
-# 美股（yfinance ticker；CIRCLE 上市代码按 CRCL，不对请改）
 STOCKS = [
     {"id": "HOOD", "symbol": "HOOD", "name": "Robinhood"},
     {"id": "MSTR", "symbol": "MSTR", "name": "MicroStrategy"},
     {"id": "CRCL", "symbol": "CRCL", "name": "Circle"},
 ]
 
-# 主流币（Binance USDT 永续/现货 ticker）
 MAJORS = [
     {"id": "BTC", "symbol": "BTCUSDT", "name": "Bitcoin"},
     {"id": "ETH", "symbol": "ETHUSDT", "name": "Ethereum"},
     {"id": "SOL", "symbol": "SOLUSDT", "name": "Solana"},
 ]
 
-# Hood 链代币：请把 address 换成真实合约（0x...）
-# 可先留空，用 DexScreener 搜索名；有地址更稳
 HOOD_TOKENS = [
-    {
-        "id": "PONS",
-        "name": "PONS",
-        "chain": "robinhood",
-        "address": "",  # TODO: 填合约地址
-        "pair_url_hint": "https://dexscreener.com/robinhood",
-    },
-    {
-        "id": "CASHCAT",
-        "name": "CASHCAT",
-        "chain": "robinhood",
-        "address": "",
-        "pair_url_hint": "https://dexscreener.com/robinhood",
-    },
-    {
-        "id": "AI",
-        "name": "AI",
-        "chain": "robinhood",
-        "address": "",
-        "pair_url_hint": "https://dexscreener.com/robinhood",
-    },
-    {
-        "id": "TENDIES",
-        "name": "TENDIES",
-        "chain": "robinhood",
-        "address": "",
-        "pair_url_hint": "https://dexscreener.com/robinhood",
-    },
+    {"id": "PONS", "name": "PONS", "chain": "robinhood", "address": ""},
+    {"id": "CASHCAT", "name": "CASHCAT", "chain": "robinhood", "address": ""},
+    {"id": "AI", "name": "AI", "chain": "robinhood", "address": ""},
+    {"id": "TENDIES", "name": "TENDIES", "chain": "robinhood", "address": ""},
 ]
 
-# 异动阈值
-ALERT_PCT_1H = 3.0          # 1h 涨跌超过 ±3% 标红
-ALERT_VOL_MULT = 2.0        # 量能相对前一段放大超过 2 倍
-CORR_LOOKBACK = 30          # 相关用最近 N 根日线（股票+币对齐）
-REFRESH_SECONDS = 15 * 60   # 15 分钟
+ALERT_PCT_1H = 3.0
+CORR_LOOKBACK = 30
+REFRESH_SECONDS = 15 * 60
 
-BINANCE_BASE = "https://api.binance.com"
+BINANCE_HOSTS = [
+    "https://api.binance.com",
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+]
+
+YF_CRYPTO = {
+    "BTCUSDT": "BTC-USD",
+    "ETHUSDT": "ETH-USD",
+    "SOLUSDT": "SOL-USD",
+}
+
+CG_IDS = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+}
+
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
+
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "market-link-monitor/1.0"})
 
 
 # =========================
-# 数据拉取
+# 工具请求
+# =========================
+
+def _binance_get(path: str, params: Optional[dict] = None, timeout: int = 12):
+    last_err = None
+    for host in BINANCE_HOSTS:
+        try:
+            r = SESSION.get(f"{host}{path}", params=params or {}, timeout=timeout)
+            if r.status_code == 200:
+                return r.json(), host
+            last_err = f"{host} HTTP {r.status_code}"
+        except Exception as e:
+            last_err = f"{host} {e}"
+    raise RuntimeError(last_err or "binance all hosts failed")
+
+
+# =========================
+# 美股
 # =========================
 
 def fetch_stock_snapshot(symbol: str) -> Dict[str, Any]:
-    """美股快照 + 近一段历史（用于相关）"""
-    t = yf.Ticker(symbol)
-    info = {}
-    try:
-        fi = t.fast_info
-        price = float(getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None) or 0)
-        prev = float(getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None) or 0)
-        volume = float(getattr(fi, "last_volume", None) or getattr(fi, "lastVolume", None) or 0)
-    except Exception:
-        price, prev, volume = 0.0, 0.0, 0.0
-
-    hist = t.history(period="3mo", interval="1d")
-    chg_1d = ((price / prev) - 1) * 100 if prev else None
-
-    # 近似 1h：用日内分钟线（若盘中）
-    chg_1h = None
-    try:
-        intraday = t.history(period="1d", interval="5m")
-        if len(intraday) >= 12:
-            p0 = float(intraday["Close"].iloc[-12])
-            p1 = float(intraday["Close"].iloc[-1])
-            if p0:
-                chg_1h = (p1 / p0 - 1) * 100
-    except Exception:
-        pass
-
-    return {
+    out = {
         "id": symbol,
         "type": "stock",
-        "price": price,
-        "chg_1h_pct": chg_1h,
-        "chg_1d_pct": chg_1d,
-        "volume": volume,
-        "hist_close": hist["Close"] if hist is not None and not hist.empty else pd.Series(dtype=float),
-        "error": None if price else "no price",
+        "price": None,
+        "chg_1h_pct": None,
+        "chg_1d_pct": None,
+        "volume": None,
+        "hist_close": pd.Series(dtype=float),
+        "source": "yfinance",
+        "error": None,
     }
+    try:
+        t = yf.Ticker(symbol)
+        try:
+            fi = t.fast_info
+            price = float(getattr(fi, "last_price", None) or getattr(fi, "lastPrice", None) or 0)
+            prev = float(getattr(fi, "previous_close", None) or getattr(fi, "previousClose", None) or 0)
+            volume = float(getattr(fi, "last_volume", None) or getattr(fi, "lastVolume", None) or 0)
+        except Exception:
+            price, prev, volume = 0.0, 0.0, 0.0
+
+        hist = t.history(period="3mo", interval="1d")
+        if (not price) and hist is not None and not hist.empty:
+            price = float(hist["Close"].iloc[-1])
+            if len(hist) > 1:
+                prev = float(hist["Close"].iloc[-2])
+            volume = float(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else 0
+
+        out["price"] = price if price else None
+        out["volume"] = volume
+        out["chg_1d_pct"] = ((price / prev) - 1) * 100 if price and prev else None
+        if hist is not None and not hist.empty:
+            out["hist_close"] = hist["Close"].astype(float)
+
+        try:
+            intraday = t.history(period="1d", interval="5m")
+            if intraday is not None and len(intraday) >= 12:
+                p0 = float(intraday["Close"].iloc[-12])
+                p1 = float(intraday["Close"].iloc[-1])
+                if p0:
+                    out["chg_1h_pct"] = (p1 / p0 - 1) * 100
+        except Exception:
+            pass
+
+        if not out["price"]:
+            out["error"] = "no price"
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+# =========================
+# 主流币：Binance → yfinance → CoinGecko
+# =========================
+
+def fetch_major_from_yfinance(binance_symbol: str) -> Dict[str, Any]:
+    yf_sym = YF_CRYPTO.get(binance_symbol)
+    out = {
+        "id": binance_symbol.replace("USDT", ""),
+        "type": "major",
+        "price": None,
+        "chg_1h_pct": None,
+        "chg_1d_pct": None,
+        "volume": None,
+        "quote_volume": None,
+        "hist_close": pd.Series(dtype=float),
+        "source": "yfinance",
+        "error": None,
+    }
+    if not yf_sym:
+        out["error"] = "no yfinance map"
+        return out
+    try:
+        t = yf.Ticker(yf_sym)
+        hist = t.history(period="3mo", interval="1d")
+        if hist is None or hist.empty:
+            out["error"] = "yfinance empty"
+            return out
+        price = float(hist["Close"].iloc[-1])
+        prev = float(hist["Close"].iloc[-2]) if len(hist) > 1 else price
+        out["price"] = price
+        out["chg_1d_pct"] = (price / prev - 1) * 100 if prev else None
+        out["volume"] = float(hist["Volume"].iloc[-1]) if "Volume" in hist.columns else None
+        out["hist_close"] = hist["Close"].astype(float)
+        try:
+            intra = t.history(period="1d", interval="5m")
+            if intra is not None and len(intra) >= 12:
+                p0 = float(intra["Close"].iloc[-12])
+                p1 = float(intra["Close"].iloc[-1])
+                out["chg_1h_pct"] = (p1 / p0 - 1) * 100 if p0 else None
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = str(e)
+    return out
+
+
+def fetch_major_from_coingecko(binance_symbol: str) -> Dict[str, Any]:
+    cid = CG_IDS.get(binance_symbol)
+    out = {
+        "id": binance_symbol.replace("USDT", ""),
+        "type": "major",
+        "price": None,
+        "chg_1h_pct": None,
+        "chg_1d_pct": None,
+        "volume": None,
+        "quote_volume": None,
+        "hist_close": pd.Series(dtype=float),
+        "source": "coingecko",
+        "error": None,
+    }
+    if not cid:
+        out["error"] = "no cg id"
+        return out
+    try:
+        r = SESSION.get(
+            "https://api.coingecko.com/api/v3/coins/markets",
+            params={"vs_currency": "usd", "ids": cid},
+            timeout=15,
+        )
+        r.raise_for_status()
+        arr = r.json()
+        if not arr:
+            out["error"] = "cg empty"
+            return out
+        j = arr[0]
+        out["price"] = float(j.get("current_price") or 0) or None
+        out["chg_1d_pct"] = float(j.get("price_change_percentage_24h") or 0)
+        out["volume"] = float(j.get("total_volume") or 0)
+        out["quote_volume"] = out["volume"]
+
+        r2 = SESSION.get(
+            f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart",
+            params={"vs_currency": "usd", "days": "90"},
+            timeout=15,
+        )
+        if r2.status_code == 200:
+            prices = r2.json().get("prices") or []
+            if prices:
+                out["hist_close"] = pd.Series([float(p[1]) for p in prices])
+    except Exception as e:
+        out["error"] = str(e)
+    return out
 
 
 def fetch_binance_snapshot(symbol: str) -> Dict[str, Any]:
-    """主流币：24h ticker + 1h K 线涨跌 + 近期日线"""
     out = {
         "id": symbol.replace("USDT", ""),
         "type": "major",
@@ -136,83 +248,105 @@ def fetch_binance_snapshot(symbol: str) -> Dict[str, Any]:
         "volume": None,
         "quote_volume": None,
         "hist_close": pd.Series(dtype=float),
+        "source": None,
         "error": None,
     }
+
+    # 1) Binance 多域名
     try:
-        r = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", params={"symbol": symbol}, timeout=12)
-        r.raise_for_status()
-        j = r.json()
+        j, host = _binance_get("/api/v3/ticker/24hr", {"symbol": symbol})
         out["price"] = float(j["lastPrice"])
         out["chg_1d_pct"] = float(j["priceChangePercent"])
         out["volume"] = float(j["volume"])
         out["quote_volume"] = float(j["quoteVolume"])
+        out["source"] = f"binance:{host}"
+
+        try:
+            kl, _ = _binance_get("/api/v3/klines", {"symbol": symbol, "interval": "1h", "limit": 2})
+            if len(kl) >= 2:
+                c0, c1 = float(kl[-2][4]), float(kl[-1][4])
+                out["chg_1h_pct"] = (c1 / c0 - 1) * 100 if c0 else None
+        except Exception:
+            pass
+
+        try:
+            kl, _ = _binance_get("/api/v3/klines", {"symbol": symbol, "interval": "1d", "limit": 90})
+            out["hist_close"] = pd.Series([float(x[4]) for x in kl])
+        except Exception:
+            pass
+
+        if out["price"]:
+            return out
     except Exception as e:
-        out["error"] = f"ticker: {e}"
-        return out
+        out["error"] = f"binance: {e}"
 
-    try:
-        r = SESSION.get(
-            f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": "1h", "limit": 2},
-            timeout=12,
+    # 2) yfinance
+    yf_out = fetch_major_from_yfinance(symbol)
+    if yf_out.get("price"):
+        if out.get("error"):
+            yf_out["error"] = out["error"]
+        return yf_out
+
+    # 3) CoinGecko
+    cg_out = fetch_major_from_coingecko(symbol)
+    if cg_out.get("price"):
+        cg_out["error"] = " | ".join(
+            x for x in [out.get("error"), yf_out.get("error")] if x
         )
-        r.raise_for_status()
-        kl = r.json()
-        if len(kl) >= 2:
-            c0, c1 = float(kl[-2][4]), float(kl[-1][4])
-            out["chg_1h_pct"] = (c1 / c0 - 1) * 100 if c0 else None
-    except Exception as e:
-        out["error"] = (out["error"] or "") + f" | 1h: {e}"
+        return cg_out
 
-    try:
-        r = SESSION.get(
-            f"{BINANCE_BASE}/api/v3/klines",
-            params={"symbol": symbol, "interval": "1d", "limit": 90},
-            timeout=12,
-        )
-        r.raise_for_status()
-        kl = r.json()
-        closes = pd.Series([float(x[4]) for x in kl])
-        out["hist_close"] = closes
-    except Exception:
-        pass
-
+    out["error"] = " | ".join(
+        x
+        for x in [
+            out.get("error"),
+            f"yf:{yf_out.get('error')}",
+            f"cg:{cg_out.get('error')}",
+        ]
+        if x
+    )
     return out
 
 
+# =========================
+# Hood / DEX
+# =========================
+
 def dexscreener_token(chain: str, address: str = "", name: str = "") -> Dict[str, Any]:
-    """
-    Hood/DEX 代币。
-    优先 address；否则用 search(name) 取流动性最高的 robinhood pair。
-    """
     out = {
-        "id": name or address[:8],
+        "id": name or (address[:8] if address else "?"),
         "type": "hood",
         "price": None,
         "chg_1h_pct": None,
         "chg_1d_pct": None,
         "volume": None,
-        "txns_h1": None,
         "buys_h1": None,
         "sells_h1": None,
+        "txns_h1": None,
         "liquidity": None,
         "pair_url": None,
         "hist_close": pd.Series(dtype=float),
+        "source": "dexscreener",
         "error": None,
     }
 
     pair = None
     try:
         if address:
-            url = f"{DEXSCREENER_BASE}/tokens/{address}"
-            r = SESSION.get(url, timeout=15)
+            r = SESSION.get(f"{DEXSCREENER_BASE}/tokens/{address}", timeout=15)
             r.raise_for_status()
             pairs = r.json().get("pairs") or []
-            # 优先匹配 chain
-            cand = [p for p in pairs if (p.get("chainId") or "").lower() in (chain.lower(), "robinhood")]
+            cand = [
+                p
+                for p in pairs
+                if (p.get("chainId") or "").lower() in (chain.lower(), "robinhood")
+            ]
             pool = cand or pairs
             if pool:
-                pair = sorted(pool, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0), reverse=True)[0]
+                pair = sorted(
+                    pool,
+                    key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0),
+                    reverse=True,
+                )[0]
         else:
             r = SESSION.get(f"{DEXSCREENER_BASE}/search", params={"q": name}, timeout=15)
             r.raise_for_status()
@@ -221,58 +355,71 @@ def dexscreener_token(chain: str, address: str = "", name: str = "") -> Dict[str
                 p
                 for p in pairs
                 if (p.get("chainId") or "").lower() in (chain.lower(), "robinhood")
-                and name.lower() in ((p.get("baseToken") or {}).get("symbol") or "").lower()
+                and name.lower()
+                in (((p.get("baseToken") or {}).get("symbol") or "").lower())
             ]
             if not pool:
-                pool = [p for p in pairs if (p.get("chainId") or "").lower() in (chain.lower(), "robinhood")]
+                pool = [
+                    p
+                    for p in pairs
+                    if (p.get("chainId") or "").lower() in (chain.lower(), "robinhood")
+                ]
             if pool:
-                pair = sorted(pool, key=lambda x: float(x.get("liquidity", {}).get("usd") or 0), reverse=True)[0]
+                pair = sorted(
+                    pool,
+                    key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0),
+                    reverse=True,
+                )[0]
     except Exception as e:
         out["error"] = str(e)
         return out
 
     if not pair:
-        out["error"] = "未找到交易对（请填合约地址）"
+        out["error"] = "未找到交易对（建议填写合约地址）"
         return out
 
     try:
-        out["price"] = float(pair.get("priceUsd") or 0)
-        out["chg_1h_pct"] = float(pair.get("priceChange", {}).get("h1") or 0)
-        out["chg_1d_pct"] = float(pair.get("priceChange", {}).get("h24") or 0)
-        out["volume"] = float(pair.get("volume", {}).get("h1") or 0)
-        vol24 = float(pair.get("volume", {}).get("h24") or 0)
-        out["volume_24h"] = vol24
-        tx = pair.get("txns", {}).get("h1") or {}
+        out["price"] = float(pair.get("priceUsd") or 0) or None
+        out["chg_1h_pct"] = float((pair.get("priceChange") or {}).get("h1") or 0)
+        out["chg_1d_pct"] = float((pair.get("priceChange") or {}).get("h24") or 0)
+        out["volume"] = float((pair.get("volume") or {}).get("h1") or 0)
+        tx = (pair.get("txns") or {}).get("h1") or {}
         out["buys_h1"] = int(tx.get("buys") or 0)
         out["sells_h1"] = int(tx.get("sells") or 0)
         out["txns_h1"] = out["buys_h1"] + out["sells_h1"]
-        out["liquidity"] = float(pair.get("liquidity", {}).get("usd") or 0)
+        out["liquidity"] = float((pair.get("liquidity") or {}).get("usd") or 0)
         out["pair_url"] = pair.get("url")
-        out["id"] = (pair.get("baseToken") or {}).get("symbol") or out["id"]
+        sym = ((pair.get("baseToken") or {}).get("symbol")) or out["id"]
+        out["id"] = sym
     except Exception as e:
         out["error"] = f"parse: {e}"
-
     return out
 
 
 def fetch_exchange_volumes() -> pd.DataFrame:
-    """简易交易所现货 24h 报价量（Binance 代表 + 可扩展）"""
     rows = []
-    # Binance 全市场 quoteVolume 汇总较重，这里用 BTC/ETH/SOL 代表量能变化
     for sym in ["BTCUSDT", "ETHUSDT", "SOLUSDT"]:
         try:
-            r = SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", params={"symbol": sym}, timeout=10)
-            j = r.json()
+            j, host = _binance_get("/api/v3/ticker/24hr", {"symbol": sym})
             rows.append(
                 {
-                    "exchange": "binance",
+                    "exchange": host,
                     "symbol": sym,
                     "quote_volume_24h": float(j["quoteVolume"]),
                     "price_chg_pct": float(j["priceChangePercent"]),
                 }
             )
         except Exception:
-            continue
+            y = fetch_major_from_yfinance(sym)
+            if y.get("price") is not None:
+                rows.append(
+                    {
+                        "exchange": "yfinance",
+                        "symbol": sym,
+                        "quote_volume_24h": y.get("volume"),
+                        "price_chg_pct": y.get("chg_1d_pct"),
+                    }
+                )
     return pd.DataFrame(rows)
 
 
@@ -290,15 +437,15 @@ def build_snapshot_table(snapshots: List[Dict[str, Any]]) -> pd.DataFrame:
                 "价格": s.get("price"),
                 "1h%": s.get("chg_1h_pct"),
                 "24h/日%": s.get("chg_1d_pct"),
-                "量能(1h或日)": s.get("volume"),
+                "量能": s.get("volume"),
                 "买1h": s.get("buys_h1"),
                 "卖1h": s.get("sells_h1"),
                 "流动性$": s.get("liquidity"),
+                "数据源": s.get("source"),
                 "错误": s.get("error"),
             }
         )
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 
 def correlation_matrix(snapshots: List[Dict[str, Any]]) -> Optional[pd.DataFrame]:
@@ -307,7 +454,6 @@ def correlation_matrix(snapshots: List[Dict[str, Any]]) -> Optional[pd.DataFrame
         hist = s.get("hist_close")
         if hist is None or len(hist) < 10:
             continue
-        # 用日收益
         rets = pd.Series(hist).pct_change().dropna()
         if len(rets) < 10:
             continue
@@ -316,23 +462,21 @@ def correlation_matrix(snapshots: List[Dict[str, Any]]) -> Optional[pd.DataFrame
     if len(series_map) < 2:
         return None
 
-    # 对齐最短长度
     min_len = min(len(v) for v in series_map.values())
     min_len = min(min_len, CORR_LOOKBACK)
     data = {k: v.iloc[-min_len:].values for k, v in series_map.items()}
-    df = pd.DataFrame(data)
-    return df.corr()
+    return pd.DataFrame(data).corr()
 
 
-def detect_alerts(snapshots: List[Dict[str, Any]]) -> List[str]:
+def detect_alerts(snapshots: List[Dict[str, Any]], alert_pct: float) -> List[str]:
     alerts = []
     for s in snapshots:
         sid = s.get("id")
         c1 = s.get("chg_1h_pct")
         c24 = s.get("chg_1d_pct")
-        if c1 is not None and abs(c1) >= ALERT_PCT_1H:
+        if c1 is not None and abs(c1) >= alert_pct:
             alerts.append(f"⚡ {sid} 1h 异动 {c1:+.2f}%")
-        if c24 is not None and abs(c24) >= ALERT_PCT_1H * 2:
+        if c24 is not None and abs(c24) >= alert_pct * 2:
             alerts.append(f"🔥 {sid} 日涨跌 {c24:+.2f}%")
         buys, sells = s.get("buys_h1"), s.get("sells_h1")
         if buys is not None and sells is not None and (buys + sells) >= 20:
@@ -345,8 +489,11 @@ def detect_alerts(snapshots: List[Dict[str, Any]]) -> List[str]:
 
 
 def lead_lag_hint(snapshots: List[Dict[str, Any]]) -> List[str]:
-    """极简：比较 1h 涨跌绝对值，谁动得大 + 同向视为联动"""
-    items = [(s["id"], s.get("chg_1h_pct")) for s in snapshots if s.get("chg_1h_pct") is not None]
+    items = [
+        (s["id"], s.get("chg_1h_pct"))
+        for s in snapshots
+        if s.get("chg_1h_pct") is not None
+    ]
     if len(items) < 2:
         return ["1h 数据不足，无法判断领先滞后"]
 
@@ -354,30 +501,27 @@ def lead_lag_hint(snapshots: List[Dict[str, Any]]) -> List[str]:
     leader, lead_chg = items_sorted[0]
     hints = [f"1h 波动最大：{leader}（{lead_chg:+.2f}%）"]
 
-    # 与股票/主流同向
     stocks = {s["id"]: s.get("chg_1h_pct") for s in snapshots if s.get("type") == "stock"}
     majors = {s["id"]: s.get("chg_1h_pct") for s in snapshots if s.get("type") == "major"}
     hoods = {s["id"]: s.get("chg_1h_pct") for s in snapshots if s.get("type") == "hood"}
 
-    def same_sign(a, b):
-        return a is not None and b is not None and a * b > 0
-
     for h, hv in hoods.items():
         for sid, sv in {**stocks, **majors}.items():
-            if same_sign(hv, sv) and abs(hv) > 1 and abs(sv) > 0.3:
+            if hv is None or sv is None:
+                continue
+            if hv * sv > 0 and abs(hv) > 1 and abs(sv) > 0.3:
                 hints.append(f"联动：{h}({hv:+.2f}%) 与 {sid}({sv:+.2f}%) 1h 同向")
     return hints[:12]
 
 
 # =========================
-# Streamlit UI
+# UI
 # =========================
 
 st.set_page_config(page_title="币股联动监控", page_icon="📊", layout="wide")
-st.title("📊 币市 × 股市 联动监控（初始版）")
-st.caption("标的：HOOD/MSTR/CRCL · BTC/ETH/SOL · Hood: PONS/CASHCAT/AI/TENDIES · 每 15 分钟自动刷新")
+st.title("📊 币市 × 股市 联动监控")
+st.caption("HOOD/MSTR/CRCL · BTC/ETH/SOL · PONS/CASHCAT/AI/TENDIES · 15 分钟自动刷新")
 
-# 侧边栏：可临时改地址
 with st.sidebar:
     st.header("⚙️ 设置")
     st.write("Hood 代币合约（可选，填了更准）")
@@ -391,18 +535,18 @@ with st.sidebar:
     alert_pct = st.number_input("1h 异动阈值 %", value=float(ALERT_PCT_1H), step=0.5)
     st.divider()
     manual = st.button("🔄 手动刷新", type="primary", use_container_width=True)
-    st.caption(f"自动刷新间隔：{REFRESH_SECONDS // 60} 分钟")
+    st.caption(f"自动刷新：{REFRESH_SECONDS // 60} 分钟")
 
-
-# 刷新控制
 if "last_fetch_ts" not in st.session_state:
     st.session_state.last_fetch_ts = 0.0
 if "cache_snap" not in st.session_state:
     st.session_state.cache_snap = None
 
 now = time.time()
-need_refresh = manual or (now - st.session_state.last_fetch_ts >= REFRESH_SECONDS) or (
-    st.session_state.cache_snap is None
+need_refresh = (
+    manual
+    or (now - st.session_state.last_fetch_ts >= REFRESH_SECONDS)
+    or (st.session_state.cache_snap is None)
 )
 
 if need_refresh:
@@ -415,7 +559,9 @@ if need_refresh:
                 data["id"] = s["id"]
                 snaps.append(data)
             except Exception as e:
-                snaps.append({"id": s["id"], "type": "stock", "error": str(e)})
+                snaps.append(
+                    {"id": s["id"], "type": "stock", "error": str(e), "source": None}
+                )
 
         for m in MAJORS:
             try:
@@ -423,7 +569,9 @@ if need_refresh:
                 data["id"] = m["id"]
                 snaps.append(data)
             except Exception as e:
-                snaps.append({"id": m["id"], "type": "major", "error": str(e)})
+                snaps.append(
+                    {"id": m["id"], "type": "major", "error": str(e), "source": None}
+                )
 
         for tok in HOOD_TOKENS:
             addr = (hood_addresses.get(tok["id"]) or "").strip()
@@ -444,14 +592,12 @@ pack = st.session_state.cache_snap
 snaps = pack["snaps"]
 ex_vol = pack["ex_vol"]
 
-# 全局改阈值
-ALERT_PCT_1H = float(alert_pct)
+last_dt = datetime.fromtimestamp(
+    st.session_state.last_fetch_ts, tz=timezone.utc
+).strftime("%Y-%m-%d %H:%M:%S UTC")
+st.info(f"最后更新：{last_dt} · 保持页面打开约每 15 分钟自动刷新")
 
-last_dt = datetime.fromtimestamp(st.session_state.last_fetch_ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-st.info(f"最后更新：{last_dt} · 下次自动刷新约在 15 分钟后（保持页面打开）")
-
-# 异动
-alerts = detect_alerts(snaps)
+alerts = detect_alerts(snaps, float(alert_pct))
 hints = lead_lag_hint(snaps)
 
 c1, c2 = st.columns(2)
@@ -468,24 +614,26 @@ with c2:
         st.write("· " + h)
 
 st.divider()
-
-# 总表
 st.subheader("📋 行情总表")
 table = build_snapshot_table(snaps)
 
 def _fmt_pct(x):
-    return f"{x:+.2f}%" if pd.notna(x) else "—"
+    try:
+        if x is None or (isinstance(x, float) and np.isnan(x)):
+            return "—"
+        return f"{float(x):+.2f}%"
+    except Exception:
+        return "—"
 
 show = table.copy()
 for col in ["1h%", "24h/日%"]:
     if col in show.columns:
-        show[col] = show[col].apply(lambda v: _fmt_pct(v) if v is not None else "—")
+        show[col] = show[col].apply(_fmt_pct)
 
-st.dataframe(show, use_container_width=True, height=420)
+st.dataframe(show, use_container_width=True, height=460)
 
-# 涨跌对比图
 st.subheader("📈 1h / 日涨跌对比")
-plot_df = table.dropna(subset=["标的"]).copy()
+plot_df = table.copy()
 plot_df["1h%"] = pd.to_numeric(plot_df["1h%"], errors="coerce")
 plot_df["24h/日%"] = pd.to_numeric(plot_df["24h/日%"], errors="coerce")
 
@@ -495,26 +643,24 @@ fig.add_bar(name="日%", x=plot_df["标的"], y=plot_df["24h/日%"])
 fig.update_layout(barmode="group", height=400, margin=dict(l=20, r=20, t=30, b=20))
 st.plotly_chart(fig, use_container_width=True)
 
-# 相关矩阵（有日线历史的标的）
 st.subheader("🧮 日收益相关矩阵（有历史的标的）")
 corr = correlation_matrix(snaps)
 if corr is not None and not corr.empty:
-    fig_c = px.imshow(corr, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1)
+    fig_c = px.imshow(
+        corr, text_auto=".2f", color_continuous_scale="RdBu", zmin=-1, zmax=1
+    )
     fig_c.update_layout(height=480, margin=dict(l=20, r=20, t=30, b=20))
     st.plotly_chart(fig_c, use_container_width=True)
 else:
-    st.write("历史序列不足（Hood 代币初始版无日线，相关主要在股票与 BTC/ETH/SOL 之间）")
+    st.write("历史序列不足（Hood 无日线时，相关主要在股票与 BTC/ETH/SOL）")
 
-# 交易所量能
-st.subheader("🏦 交易所代表量能（Binance BTC/ETH/SOL 24h Quote Volume）")
+st.subheader("🏦 交易所代表量能（BTC/ETH/SOL）")
 if ex_vol is not None and not ex_vol.empty:
     st.dataframe(ex_vol, use_container_width=True)
-    st.caption("进阶可扩 DefiLlama / 多所 ticker，做环比突变预警（类似 perpdexlist）")
 else:
     st.write("暂无数据")
 
-# Hood 买卖对比
-st.subheader("🦊 Hood 代币 1h 买卖笔数")
+st.subheader("🦊 Hood 代币 1h 买卖")
 hood_rows = [s for s in snaps if s.get("type") == "hood"]
 if hood_rows:
     hdf = pd.DataFrame(
@@ -540,21 +686,20 @@ else:
 st.divider()
 st.markdown(
     """
-### 使用说明
-1. 左侧可填 **PONS / CASHCAT / AI / TENDIES** 合约地址（推荐），不填则按名称在 DexScreener 搜索，可能不准。  
-2. 保持页面打开会约每 **15 分钟** 自动刷新；也可点 **手动刷新**。  
-3. Streamlit Cloud 休眠后，重新打开页面会立刻拉一次数。  
-4. 下一步可加：Telegram 推送、多所量能突变、真实 lead-lag 相关。
+### 说明
+- **BTC/ETH/SOL** 顺序：Binance 多域名 → Yahoo(yfinance) → CoinGecko  
+- 看表中 **数据源 / 错误** 列可判断当前走了哪一路  
+- Hood 代币建议在左侧填写合约地址  
+- Streamlit Cloud 休眠后重新打开会立刻刷新一次  
 """
 )
 
-# 自动刷新：到点 rerun
 elapsed = time.time() - st.session_state.last_fetch_ts
 remain = max(0, REFRESH_SECONDS - int(elapsed))
 st.caption(f"距下次自动刷新约 {remain // 60} 分 {remain % 60} 秒")
+
 if remain <= 0:
     st.rerun()
 else:
-    # 轻量等待后检查（避免空转过狠）
     time.sleep(min(30, remain))
     st.rerun()
